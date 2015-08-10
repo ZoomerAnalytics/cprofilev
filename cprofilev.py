@@ -41,16 +41,30 @@ STATS_TEMPLATE = """\
         % if callers:
             <h2>Called By:</h2>
             <pre>{{ !callers }}</pre>
+        % end
 
         % if callees:
             <h2>Called:</h2>
             <pre>{{ !callees }}</pre>
+        % end
+
+        <h3>Restrictions applied to get stats listed above:</h3>
+        % if restrictions:
+            <ul>
+            % for r in restrictions:
+                <li><pre>{{ !r }}</pre></li>
+            % end
+            </ul>
+        % else:
+            None
+        % end
     </body>
 </html>"""
 
 
 SORT_KEY = 'sort'
 FUNC_NAME_KEY = 'func_name'
+FUNC_LOC_KEY = 'func_loc'
 
 
 class Stats(object):
@@ -68,6 +82,7 @@ class Stats(object):
 
     STATS_LINE_REGEX = r'(.*)\((.*)\)$'
     HEADER_LINE_REGEX = r'ncalls|tottime|cumtime'
+    FUNCTION_SIG_HEADER = 'filename:lineno(function)'
 
     def __init__(self, profile_output=None, profile_obj=None):
         self.profile = profile_output or profile_obj
@@ -83,19 +98,31 @@ class Stats(object):
     def read(self):
         output = self.read_stream()
         lines = output.splitlines(True)
-        return "".join(map(self.process_line, lines))
+        info = {}
+        for i in range(len(lines)):
+            lines[i] = self.process_line(lines[i], info)
+        return "".join(lines)
 
     @classmethod
-    def process_line(cls, line):
+    def process_line(cls, line, info):
         # Format header lines (such that clicking on a column header sorts by
         # that column).
         if re.search(cls.HEADER_LINE_REGEX, line):
+
+            # Find and store the index of the function signature column
+            if 'func_col_pos' not in info:
+                match = line.find(cls.FUNCTION_SIG_HEADER)
+                if match >= 0:
+                    info['func_col_pos'] = match
+
+            # Replace sort keys with links
             for key, val in cls.SORT_ARGS.items():
                 url_link = bottle.template(
                     "<a href='{{ url }}'>{{ key }}</a>",
-                    url=cls.get_updated_href(SORT_KEY, val),
+                    url=cls.get_updated_href({SORT_KEY: val}),
                     key=key)
                 line = line.replace(key, url_link)
+
         # Format stat lines (such that clicking on the function name drills into
         # the function call).
         match = re.search(cls.STATS_LINE_REGEX, line)
@@ -103,34 +130,45 @@ class Stats(object):
             prefix = match.group(1)
             func_name = match.group(2)
             if func_name not in cls.IGNORE_FUNC_NAMES:
+                if 'func_col_pos' in info:
+                    func_loc = prefix[info['func_col_pos']:]
+                    prefix = prefix[:info['func_col_pos']]
+                    full_url_link = bottle.template(
+                        "<a href='{{ url }}'>{{ func_loc }}</a>",
+                        url=cls.get_updated_href({FUNC_LOC_KEY: func_loc, FUNC_NAME_KEY: func_name}),
+                        func_loc=func_loc)
+                else:
+                    full_url_link = ''
                 url_link = bottle.template(
                     "<a href='{{ url }}'>{{ func_name }}</a>",
-                    url=cls.get_updated_href(FUNC_NAME_KEY, func_name),
+                    url=cls.get_updated_href({FUNC_LOC_KEY: None, FUNC_NAME_KEY: func_name}),
                     func_name=func_name)
                 line = bottle.template(
-                    "{{ prefix }}({{ !url_link }})\n",
-                    prefix=prefix, url_link=url_link)
+                    "{{ prefix }}{{ !full_url_link }}({{ !url_link }})\n",
+                    prefix=prefix, full_url_link=full_url_link, url_link=url_link)
         return line
 
     @classmethod
-    def get_updated_href(cls, key, val):
+    def get_updated_href(cls, keyvals):
         href = '?'
         query = dict(bottle.request.query)
-        query[key] = val
+        for key, val in keyvals.items():
+            query[key] = val
         for key in query.keys():
-            href += '%s=%s&' % (key, query[key])
+            if query[key] is not None:
+                href += '%s=%s&' % (key, query[key])
         return href[:-1]
 
-    def show(self, restriction=''):
-        self.stats.print_stats(restriction)
+    def show(self, *restrictions):
+        self.stats.print_stats(*restrictions)
         return self
 
-    def show_callers(self, func_name):
-        self.stats.print_callers(func_name)
+    def show_callers(self, *restriction):
+        self.stats.print_callers(*restriction)
         return self
 
-    def show_callees(self, func_name):
-        self.stats.print_callees(func_name)
+    def show_callees(self, *restriction):
+        self.stats.print_callees(*restriction)
         return self
 
     def sort(self, sort=''):
@@ -154,16 +192,24 @@ class CProfileV(object):
         self.stats = Stats(self.profile)
 
         func_name = bottle.request.query.get(FUNC_NAME_KEY) or ''
+        func_loc = bottle.request.query.get(FUNC_LOC_KEY) or ''
         sort = bottle.request.query.get(SORT_KEY) or ''
 
+        restrictions = []
+        if func_name:
+            restrictions.append(r"\(" + re.escape(func_name) + r"\)")
+        if func_loc:
+            restrictions.append("^" + re.escape(func_loc))
+
         self.stats.sort(sort)
-        callers = self.stats.show_callers(func_name).read() if func_name else ''
-        callees = self.stats.show_callees(func_name).read() if func_name else ''
+        callers = self.stats.show_callers(*restrictions).read() if func_name else ''
+        callees = self.stats.show_callees(*restrictions).read() if func_name else ''
         data = {
             'title': self.title,
-            'stats': self.stats.sort(sort).show(func_name).read(),
+            'stats': self.stats.sort(sort).show(*restrictions).read(),
             'callers': callers,
             'callees': callees,
+            'restrictions': restrictions
         }
         return bottle.template(STATS_TEMPLATE, **data)
 
